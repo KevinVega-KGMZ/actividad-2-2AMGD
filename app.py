@@ -53,7 +53,7 @@ def load_model_from_gcs(bucket_name, source_blob):
 # =========================================================
 # CONFIGURACIÓN DE PARÁMETROS
 # =========================================================
-bucket_name = st.text_input("Nombre del bucket de GCS:", "bucket_131025")
+bucket_name = st.text_input("Nombre del bucket de GCS:", "p1_kgvr_bucket")
 prefix = st.text_input("Carpeta/prefijo dentro del bucket:", "tlc_yellow_trips_2022/")
 limite = st.number_input("Número de registros por archivo a procesar:", value=1000, step=100)
 mostrar_grafico = st.checkbox("Mostrar gráfico de evolución del R²", value=True)
@@ -162,3 +162,4 @@ if st.session_state.history:
     st.line_chart(st.session_state.history, height=200, use_container_width=True)
 
 st.caption("Cloud Run + River • Dataset público de taxis NYC (2022)")
+
