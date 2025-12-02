@@ -4,17 +4,18 @@ import numpy as np
 import io
 import pickle
 from google.cloud import storage
-from river import linear_model, preprocessing, metrics
+# Importamos optim para controlar la tasa de aprendizaje
+from river import linear_model, preprocessing, metrics, optim
 
 # =========================================================
 # CONFIGURACIÓN
 # =========================================================
-st.set_page_config(page_title="Aprendizaje en línea", page_icon="")
-st.title("Aprendizaje en línea con River (Step-by-step desde GCS)")
+st.set_page_config(page_title="Aprendizaje en línea Corregido", page_icon="")
+st.title("Aprendizaje en línea con River (Corregido)")
 
 st.markdown("""
-Este panel replica **exactamente** la lógica original del código del estudiante,
-pero ahora permite procesar **un archivo por clic**, en lugar de procesar todo el bucket.
+Este panel replica la lógica del estudiante con correcciones para evitar
+la explosión del gradiente (R2 negativo masivo).
 """)
 
 # =========================================================
@@ -26,7 +27,8 @@ def save_model_to_gcs(model, bucket_name, destination_blob):
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(destination_blob)
         blob.upload_from_string(pickle.dumps(model))
-        st.success(f"Modelo guardado en GCS: {destination_blob}")
+        # Opcional: comentar el success para no llenar la pantalla si son muchos archivos
+        # st.success(f"Modelo guardado en GCS: {destination_blob}")
     except Exception as e:
         st.warning(f"No se pudo guardar el modelo: {e}")
 
@@ -53,6 +55,7 @@ bucket_name = st.text_input("Bucket de GCS:", "p1_kgvr_bucket")
 prefix = st.text_input("Prefijo/carpeta:", "tlc_yellow_trips_2022/")
 limite = st.number_input("Filas a procesar por archivo:", value=1000, step=100)
 
+# CAMBIO IMPORTANTE: Usamos un nombre nuevo para no cargar el modelo "roto" anterior
 MODEL_PATH = "models/model_incremental.pkl"
 
 # =========================================================
@@ -60,8 +63,14 @@ MODEL_PATH = "models/model_incremental.pkl"
 # =========================================================
 if "model" not in st.session_state:
     model = load_model_from_gcs(bucket_name, MODEL_PATH)
+    
     if model is None:
-        model = preprocessing.StandardScaler() | linear_model.LinearRegression()
+        # CORRECCIÓN: Definimos un optimizador con learning rate bajo (0.005)
+        # Esto previene que los pesos se vayan a infinito.
+        optimizer = optim.SGD(lr=0.005)
+        
+        model = preprocessing.StandardScaler() | linear_model.LinearRegression(optimizer=optimizer)
+        st.info("Creando nuevo modelo con Learning Rate controlado (0.005).")
 
     st.session_state.model = model
     st.session_state.metric = metrics.R2()
@@ -75,7 +84,7 @@ model = st.session_state.model
 metric = st.session_state.metric
 
 # =========================================================
-# FEATURE ENGINEERING (idéntico al estudiante)
+# FEATURE ENGINEERING
 # =========================================================
 def _parse_time_fields(row):
     if "pickup_hour" in row and pd.notna(row["pickup_hour"]):
@@ -116,7 +125,7 @@ def _valid_target(v):
     return float(y)
 
 # =========================================================
-# PROCESAR UN SOLO ARCHIVO (MISMA LÓGICA DEL ESTUDIANTE)
+# PROCESAR UN SOLO ARCHIVO
 # =========================================================
 def process_single_blob(bucket_name, blob_name, limite=1000, chunksize=500):
 
@@ -129,6 +138,7 @@ def process_single_blob(bucket_name, blob_name, limite=1000, chunksize=500):
         buffer = io.BytesIO(content)
         count = 0
 
+        # low_memory=False ayuda a pandas a inferir tipos mejor, evitando warnings
         for chunk in pd.read_csv(buffer, chunksize=chunksize, low_memory=False):
 
             if not {"trip_distance","passenger_count","fare_amount"}.issubset(chunk.columns):
@@ -138,10 +148,12 @@ def process_single_blob(bucket_name, blob_name, limite=1000, chunksize=500):
                 chunk[col] = pd.to_numeric(chunk[col], errors="coerce")
 
             chunk = chunk.replace([np.inf, -np.inf], np.nan).dropna()
+            
+            # Filtros de sentido común para evitar outliers masivos que rompen el modelo
             chunk = chunk[
-                chunk["fare_amount"].between(2,200) &
-                chunk["trip_distance"].between(0.1,50) &
-                chunk["passenger_count"].between(1,6)
+                chunk["fare_amount"].between(2, 200) &
+                chunk["trip_distance"].between(0.1, 100) &
+                chunk["passenger_count"].between(1, 8)
             ]
 
             for _, row in chunk.iterrows():
@@ -159,6 +171,9 @@ def process_single_blob(bucket_name, blob_name, limite=1000, chunksize=500):
                 metric.update(y, pred)
 
                 count += 1
+            
+            if count >= limite:
+                break
 
     except Exception as e:
         st.warning(f"Error en {blob_name}: {e}")
@@ -174,26 +189,38 @@ if st.button("Procesar siguiente archivo"):
     if st.session_state.blobs is None:
         client = storage.Client()
         bucket = client.bucket(bucket_name)
-        st.session_state.blobs = list(bucket.list_blobs(prefix=prefix))
+        # Listamos los blobs y los convertimos a lista para iterar
+        blobs_iterator = bucket.list_blobs(prefix=prefix)
+        st.session_state.blobs = list(blobs_iterator)
         st.session_state.index = 0
         st.info(f"Se encontraron {len(st.session_state.blobs)} archivos.")
 
     blobs = st.session_state.blobs
     idx = st.session_state.index
 
-    if idx >= len(blobs):
+    if not blobs:
+        st.warning("No se encontraron archivos en esa ruta.")
+    elif idx >= len(blobs):
         st.success("Todos los archivos ya fueron procesados.")
     else:
         blob = blobs[idx]
         short = blob.name.split("/")[-1]
+        
+        # Ignorar carpetas o archivos vacíos si los hubiera
+        if short == "":
+            st.session_state.index += 1
+            st.rerun()
+            
         st.write(f"Procesando {idx+1}/{len(blobs)}: `{short}`")
 
         score = process_single_blob(bucket_name, blob.name, int(limite))
 
         if score is not None:
             st.session_state.history.append(score)
-            st.write(f"{blob.name} — R² acumulado: **{score:.3f}**")
+            st.write(f"{blob.name} — R² acumulado: **{score:.4f}**")
             save_model_to_gcs(model, bucket_name, MODEL_PATH)
+        else:
+            st.write("Archivo saltado o sin datos válidos.")
 
         st.session_state.index += 1
 
@@ -202,13 +229,9 @@ if st.button("Procesar siguiente archivo"):
 # =========================================================
 st.markdown("---")
 st.subheader("Estado actual del modelo")
-st.write(f"R² actual: **{metric.get():.3f}**")
+st.write(f"R² actual: **{metric.get():.4f}**")
 
 if st.session_state.history:
     st.line_chart(st.session_state.history)
 
-
-st.caption("Cloud Run + River • Dataset público de taxis NYC (2022)_221125")
-
-
-
+st.caption("Cloud Run + River • Dataset público de taxis NYC (2022)")
